@@ -16,7 +16,6 @@ import org.apache.kafka.connect.transforms.util.SimpleConfig;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.apache.kafka.connect.transforms.util.Requirements.requireMap;
 import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
@@ -24,34 +23,33 @@ import static org.apache.kafka.connect.transforms.util.Requirements.requireStruc
 public abstract class modify<R extends ConnectRecord<R>> implements Transformation<R> {
 
   public static final String OVERVIEW_DOC =
-    "Insert a random UUID into a connect record";
+    "Clean special characters from specified fields in a connect record";
 
   private interface ConfigName {
-    String UUID_FIELD_NAME = "uuid.field.name";
-    String FIXED_UUID = "uuid.fixed.value";
+    String FIELDS_TO_CLEAN = "field.name";
   }
 
   public static final ConfigDef CONFIG_DEF = new ConfigDef()
-    .define(ConfigName.UUID_FIELD_NAME, ConfigDef.Type.STRING, "uuid", ConfigDef.Importance.HIGH,
-      "Field name for UUID")
-    .define(ConfigName.FIXED_UUID, ConfigDef.Type.STRING, UUID.randomUUID().toString(), ConfigDef.Importance.LOW,
-      "Fixed UUID value for testing");
+    .define(ConfigName.FIELDS_TO_CLEAN, ConfigDef.Type.STRING, ConfigDef.Importance.HIGH,
+      "Comma-separated list of fields to clean special characters from");
 
-  private static final String PURPOSE = "adding UUID to record";
+  private static final String PURPOSE = "cleaning special characters from fields";
 
-  private String fieldName;
-  private String fixedUuid;
+  private String[] fieldsToClean;
   private Cache<Schema, Schema> schemaUpdateCache;
 
   @Override
   public void configure(Map<String, ?> props) {
     final SimpleConfig config = new SimpleConfig(CONFIG_DEF, props);
-    fieldName = config.getString(ConfigName.UUID_FIELD_NAME);
-    fixedUuid = config.getString(ConfigName.FIXED_UUID);
+    String fieldsList = config.getString(ConfigName.FIELDS_TO_CLEAN);
+    fieldsToClean = fieldsList.split(",");
+    // Trim whitespace from field names
+    for (int i = 0; i < fieldsToClean.length; i++) {
+      fieldsToClean[i] = fieldsToClean[i].trim();
+    }
 
     schemaUpdateCache = new SynchronizedCache<>(new LRUCache<Schema, Schema>(16));
   }
-
 
   @Override
   public R apply(R record) {
@@ -64,32 +62,57 @@ public abstract class modify<R extends ConnectRecord<R>> implements Transformati
 
   private R applySchemaless(R record) {
     final Map<String, Object> value = requireMap(operatingValue(record), PURPOSE);
-
     final Map<String, Object> updatedValue = new HashMap<>(value);
 
-    updatedValue.put(fieldName, getRandomUuid());
+    for (String fieldName : fieldsToClean) {
+      if (updatedValue.containsKey(fieldName) && updatedValue.get(fieldName) instanceof String) {
+        String fieldValue = (String) updatedValue.get(fieldName);
+        if (fieldValue != null) {
+          // Replace null characters and other special characters
+          String cleanedValue = fieldValue.replaceAll("\\x00", "");
+          updatedValue.put(fieldName, cleanedValue);
+        }
+      }
+    }
 
     return newRecord(record, null, updatedValue);
   }
 
   private R applyWithSchema(R record) {
     final Struct value = requireStruct(operatingValue(record), PURPOSE);
-
     Schema updatedSchema = schemaUpdateCache.get(value.schema());
-    if(updatedSchema == null) {
-      updatedSchema = makeUpdatedSchema(value.schema());
+    if (updatedSchema == null) {
+      updatedSchema = value.schema(); // We're not modifying the schema
       schemaUpdateCache.put(value.schema(), updatedSchema);
     }
 
     final Struct updatedValue = new Struct(updatedSchema);
 
+    // Copy all fields
     for (Field field : value.schema().fields()) {
-      updatedValue.put(field.name(), value.get(field));
+      Object fieldValue = value.get(field);
+      
+      // Clean specified string fields
+      if (fieldValue instanceof String && contains(fieldsToClean, field.name())) {
+        String stringValue = (String) fieldValue;
+        // Replace null characters and other special characters
+        String cleanedValue = stringValue.replaceAll("\\x00", "");
+        updatedValue.put(field.name(), cleanedValue);
+      } else {
+        updatedValue.put(field.name(), fieldValue);
+      }
     }
 
-    updatedValue.put(fieldName, getRandomUuid());
-
     return newRecord(record, updatedSchema, updatedValue);
+  }
+
+  private boolean contains(String[] array, String value) {
+    for (String item : array) {
+      if (item.equals(value)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @Override
@@ -100,22 +123,6 @@ public abstract class modify<R extends ConnectRecord<R>> implements Transformati
   @Override
   public void close() {
     schemaUpdateCache = null;
-  }
-
-  private String getRandomUuid() {
-    return fixedUuid;
-  }
-
-  private Schema makeUpdatedSchema(Schema schema) {
-    final SchemaBuilder builder = SchemaUtil.copySchemaBasics(schema, SchemaBuilder.struct());
-
-    for (Field field: schema.fields()) {
-      builder.field(field.name(), field.schema());
-    }
-
-    builder.field(fieldName, Schema.OPTIONAL_STRING_SCHEMA);
-
-    return builder.build();
   }
 
   protected abstract Schema operatingSchema(R record);
