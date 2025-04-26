@@ -53,6 +53,10 @@ public abstract class modify<R extends ConnectRecord<R>> implements Transformati
 
   @Override
   public R apply(R record) {
+    if (operatingValue(record) == null) {
+      return record;
+    }
+    
     if (operatingSchema(record) == null) {
       return applySchemaless(record);
     } else {
